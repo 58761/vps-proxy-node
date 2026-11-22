@@ -2793,8 +2793,12 @@ install_self_script() {
 do_self_update() {
   require_root
   local tmp_new="/var/tmp/vps-node-install.new"
+  local fetch_url="$SCRIPT_URL"
+  if [[ "$fetch_url" != *\?* ]]; then
+    fetch_url="${fetch_url}?t=$(date +%s)"
+  fi
   log_info "从 ${SCRIPT_URL} 检查并下载最新脚本..."
-  fetch_with_auth "$SCRIPT_URL" "$tmp_new"
+  fetch_with_auth "$fetch_url" "$tmp_new"
   sed -i 's/\r$//' "$tmp_new"
   if ! bash -n "$tmp_new"; then
     rm -f "$tmp_new"
