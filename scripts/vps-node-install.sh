@@ -806,11 +806,12 @@ install_singbox() {
 
 install_hysteria() {
   log_info "下载最新 Hysteria2 (${ARCH})..."
-  local tag url
+  local tag url tmp="/var/tmp/hysteria-download.bin"
   tag="$(github_latest_tag "apernet/hysteria")"
   url="https://github.com/apernet/hysteria/releases/download/${tag}/hysteria-linux-${ARCH}"
-  curl -fsSL "$url" -o /usr/local/bin/hysteria
-  chmod +x /usr/local/bin/hysteria
+  curl -fsSL "$url" -o "$tmp"
+  chmod +x "$tmp"
+  mv -f "$tmp" /usr/local/bin/hysteria
   log_ok "Hysteria2 安装完成: $(/usr/local/bin/hysteria version | head -n1)"
 }
 
