@@ -2793,12 +2793,19 @@ install_self_script() {
 do_self_update() {
   require_root
   local tmp_new="/var/tmp/vps-node-install.new"
-  local fetch_url="$SCRIPT_URL"
-  if [[ "$fetch_url" != *\?* ]]; then
-    fetch_url="${fetch_url}?t=$(date +%s)"
+  local api_url="https://api.github.com/repos/${DEFAULT_REPO}/contents/scripts/vps-node-install.sh?ref=main"
+  log_info "检查并下载最新脚本 (${DEFAULT_REPO})..."
+  local fetched=0
+  if [[ "$SCRIPT_URL" == "https://raw.githubusercontent.com/${DEFAULT_REPO}/"* ]]; then
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+      curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw+json" "$api_url" -o "$tmp_new" 2>/dev/null && fetched=1 || true
+    else
+      curl -fsSL -H "Accept: application/vnd.github.raw+json" "$api_url" -o "$tmp_new" 2>/dev/null && fetched=1 || true
+    fi
   fi
-  log_info "从 ${SCRIPT_URL} 检查并下载最新脚本..."
-  fetch_with_auth "$fetch_url" "$tmp_new"
+  if [[ "$fetched" -eq 0 ]]; then
+    fetch_with_auth "$SCRIPT_URL" "$tmp_new"
+  fi
   sed -i 's/\r$//' "$tmp_new"
   if ! bash -n "$tmp_new"; then
     rm -f "$tmp_new"
