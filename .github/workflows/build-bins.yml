@@ -1,0 +1,94 @@
+name: Build Prebuilt Binaries
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 4 * * 1'
+  push:
+    paths:
+      - '.github/workflows/build-bins.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            goarch: amd64
+          - arch: arm64
+            goarch: arm64
+
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+
+      - name: Install xcaddy
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      - name: Build caddy-l4 (${{ matrix.arch }})
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          xcaddy build --with github.com/mholt/caddy-l4 --output "dist/caddy-l4-linux-${{ matrix.arch }}"
+          if [[ "${{ matrix.arch }}" == "amd64" ]]; then
+            chmod +x "dist/caddy-l4-linux-${{ matrix.arch }}"
+            "dist/caddy-l4-linux-${{ matrix.arch }}" list-modules | grep -q "layer4"
+          fi
+
+      - name: Build minimal sing-box with_v2ray_api (${{ matrix.arch }})
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          TAG="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r '.tag_name')"
+          echo "Building sing-box ${TAG} for ${{ matrix.arch }}"
+          git clone --depth=1 --branch "${TAG}" https://github.com/SagerNet/sing-box.git /tmp/sing-box-src
+          cd /tmp/sing-box-src
+          go build -ldflags "-s -w" -tags "with_v2ray_api" -o "${GITHUB_WORKSPACE}/dist/sing-box-linux-${{ matrix.arch }}" ./cmd/sing-box
+          if [[ "${{ matrix.arch }}" == "amd64" ]]; then
+            chmod +x "${GITHUB_WORKSPACE}/dist/sing-box-linux-${{ matrix.arch }}"
+            "${GITHUB_WORKSPACE}/dist/sing-box-linux-${{ matrix.arch }}" version | grep -q "with_v2ray_api"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Publish Release (latest)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Prebuilt Binaries (latest)
+          body: |
+            Automated prebuilt binaries for `vps-node-install.sh`:
+            - `caddy-l4-linux-amd64` / `caddy-l4-linux-arm64` (Caddy + `github.com/mholt/caddy-l4`)
+            - `sing-box-linux-amd64` / `sing-box-linux-arm64` (minimal `sing-box` with `with_v2ray_api`)
+          prerelease: false
+          make_latest: true
+          files: artifacts/*
