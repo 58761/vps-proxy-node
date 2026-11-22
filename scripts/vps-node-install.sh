@@ -1088,7 +1088,8 @@ def build_user_links(cfg: dict[str, Any], username: str, creds: dict[str, str]) 
     if "hy2" in enabled:
         dom = cfg["hy2"]["domain"]
         pw = urllib.parse.quote(creds["hy2_password"], safe="")
-        links["hy2"] = f"hysteria2://{pw}@{dom}:443/?sni={dom}#{username}-Hy2"
+        uname_q = urllib.parse.quote(username, safe="")
+        links["hy2"] = f"hysteria2://{uname_q}:{pw}@{dom}:443/?sni={dom}#{username}-Hy2"
 
     if "vless_xhttp_tls" in enabled:
         dom = cfg["vless_xhttp_tls"]["domain"]
@@ -1501,7 +1502,7 @@ class ProxyStateStore:
         if "hy2" in enabled:
             hy2 = self.cfg["hy2"]
             lines = [
-                f"listen: 127.0.0.1:{int(hy2['local_port'])}",
+                "listen: :443",
                 "tls:",
                 f"  cert: {hy2['cert_path']}",
                 f"  key: {hy2['key_path']}",
@@ -2433,18 +2434,6 @@ EOF
                 proxy 127.0.0.1:${PORT_CADDY_L7_HTTPS}
             }
         }
-EOF
-    if proto_enabled "hy2"; then
-      cat <<EOF
-        udp/:443 {
-            @hy2 quic sni ${HY2_DOMAIN}
-            route @hy2 {
-                proxy udp/127.0.0.1:${PORT_HY2_LOCAL}
-            }
-        }
-EOF
-    fi
-    cat <<EOF
     }
 }
 
@@ -2733,9 +2722,9 @@ start_all_services() {
   log_info "同步用户并渲染代理内核配置..."
   OWNER_JSON="$(python3 "${APP_DIR}/proxy_manager.py" init-owner)"
 
-  # 启动或平滑重载 Caddy（签发新子域名证书）
+  # 启动或重启 Caddy（确保签发新子域名证书并释放未使用的 L4 端口）
   if systemctl is-active --quiet caddy; then
-    systemctl reload caddy || systemctl restart caddy
+    systemctl restart caddy
   else
     systemctl enable --now caddy
   fi
