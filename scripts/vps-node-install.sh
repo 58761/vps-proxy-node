@@ -992,9 +992,11 @@ from __future__ import annotations
 
 import base64
 import calendar
+import copy
 from contextlib import contextmanager
 import datetime as dt
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -1022,6 +1024,8 @@ TOKEN_PATH = STACK_DIR / "admin.token"
 DB_PATH = DATA_DIR / "state.db"
 
 USERNAME_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
+OUTBOUND_TAG_RE = re.compile(r"^[a-zA-Z0-9_-]{1,48}$")
+RESERVED_OUTBOUND_TAGS = {"direct", "blocked", "api", "reject", "default"}
 QUOTA_RE = re.compile(r"^(0|[1-9][0-9]*)(B|KiB|MiB|GiB|TiB)$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -1166,6 +1170,445 @@ def build_user_links(cfg: dict[str, Any], username: str, creds: dict[str, str]) 
         links["ss2022"] = f"ss://{b64_cred}@{main_domain}:{scfg['port']}#{username}-SS2022"
 
     return links
+
+
+# ─── Multi-Outbound URI Parser & Routing Helpers ──────────────────────────────
+
+def _b64_decode_str(s: str) -> str:
+    cleaned = re.sub(r"\s+", "", s.strip())
+    padded = cleaned + ("=" * ((-len(cleaned)) % 4))
+    try:
+        return base64.b64decode(padded, validate=False).decode("utf-8", errors="ignore")
+    except Exception:
+        return base64.urlsafe_b64decode(padded).decode("utf-8", errors="ignore")
+
+
+def parse_outbound_uri(uri: str) -> dict[str, Any]:
+    """Parse socks5://, http(s)://, vless://, anytls://, hysteria2://, ss:// into canonical IR."""
+    if not isinstance(uri, str) or "://" not in uri.strip():
+        raise ValueError("invalid outbound uri")
+    raw = uri.strip()
+    scheme = raw.split("://", 1)[0].lower()
+    if scheme == "hy2":
+        scheme = "hysteria2"
+
+    if scheme == "ss":
+        body = raw[5:].split("#", 1)[0]
+        if "?" in body:
+            body = body.split("?", 1)[0]
+        if "@" in body:
+            userinfo, hostport = body.rsplit("@", 1)
+            if ":" in userinfo:
+                cipher, password = urllib.parse.unquote(userinfo).split(":", 1)
+            else:
+                decoded = _b64_decode_str(userinfo)
+                if ":" not in decoded:
+                    raise ValueError("invalid ss userinfo")
+                cipher, password = decoded.split(":", 1)
+        else:
+            decoded = _b64_decode_str(body)
+            if "@" not in decoded:
+                raise ValueError("invalid ss uri")
+            userinfo, hostport = decoded.rsplit("@", 1)
+            cipher, password = userinfo.split(":", 1)
+        hp = urllib.parse.urlsplit(f"ss://{hostport}")
+        if not hp.hostname or not hp.port:
+            raise ValueError("invalid ss host or port")
+        return {
+            "protocol": "ss",
+            "server": hp.hostname,
+            "port": int(hp.port),
+            "cipher": cipher,
+            "password": password,
+            "raw_uri": raw,
+        }
+
+    if scheme not in ("socks5", "socks", "http", "https", "vless", "anytls", "hysteria2"):
+        raise ValueError(f"unsupported outbound scheme: {scheme}")
+    if scheme == "socks":
+        scheme = "socks5"
+
+    parts = urllib.parse.urlsplit(raw)
+    host = parts.hostname or ""
+    if not host:
+        raise ValueError("missing outbound server host")
+    port = parts.port
+    if port is None:
+        port = 443 if scheme in ("https", "vless", "anytls", "hysteria2") else (1080 if scheme == "socks5" else 80)
+    qs = urllib.parse.parse_qs(parts.query, keep_blank_values=False)
+
+    def q1(*keys: str) -> str | None:
+        for k in keys:
+            vals = qs.get(k)
+            if vals and vals[0] != "":
+                return vals[0]
+        return None
+
+    username = urllib.parse.unquote(parts.username or "")
+    password = urllib.parse.unquote(parts.password or "")
+    security = (q1("security") or ("tls" if scheme in ("https", "anytls", "hysteria2") else "none")).lower()
+    alpn_raw = q1("alpn")
+    alpn = [x.strip() for x in alpn_raw.split(",") if x.strip()] if alpn_raw else []
+    insecure = (q1("insecure", "allowInsecure", "skip-cert-verify") or "").lower() in ("1", "true", "yes")
+
+    ir: dict[str, Any] = {
+        "protocol": scheme,
+        "server": host,
+        "port": int(port),
+        "username": username,
+        "password": password,
+        "uuid": username if scheme == "vless" else "",
+        "tls": security in ("tls", "reality") or scheme in ("https", "anytls", "hysteria2"),
+        "security": security,
+        "sni": q1("sni", "peer") or host,
+        "insecure": insecure,
+        "fp": q1("fp", "client-fingerprint") or "",
+        "alpn": alpn,
+        "flow": q1("flow") or "",
+        "network": (q1("type") or "tcp").lower(),
+        "path": q1("path") or "/",
+        "host": q1("host") or "",
+        "service_name": q1("serviceName", "service-name") or "",
+        "mode": q1("mode") or "auto",
+        "pbk": q1("pbk") or "",
+        "sid": q1("sid") or "",
+        "obfs": q1("obfs") or "",
+        "obfs_password": q1("obfs-password") or "",
+        "raw_uri": raw,
+    }
+    if scheme == "vless" and not ir["uuid"]:
+        raise ValueError("vless outbound missing uuid")
+    if scheme in ("anytls", "hysteria2") and not ir["password"] and not ir["username"]:
+        raise ValueError(f"{scheme} outbound missing password")
+    return ir
+
+
+def mask_outbound_uri(uri: str) -> str:
+    """Mask passwords/UUIDs in outbound URI while preserving scheme, host, port, query, and fragment."""
+    raw = (uri or "").strip()
+    if "://" not in raw:
+        return "***"
+    scheme = raw.split("://", 1)[0]
+    if scheme.lower() == "ss":
+        body = raw[5:]
+        frag = ""
+        if "#" in body:
+            body, frag = body.split("#", 1)
+            frag = "#" + frag
+        if "@" in body:
+            _, hostpart = body.rsplit("@", 1)
+            return f"ss://***@{hostpart}{frag}"
+        try:
+            ir = parse_outbound_uri(raw)
+            return f"ss://***@{ir['server']}:{ir['port']}{frag}"
+        except Exception:
+            return f"ss://***{frag}"
+    parts = urllib.parse.urlsplit(raw)
+    host = parts.hostname or ""
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    if parts.username is not None or parts.password is not None:
+        netloc = f"***@{netloc}"
+    return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+
+def is_masked_or_empty_uri(uri: Any, prev_uri: str | None = None) -> bool:
+    if uri is None:
+        return True
+    if not isinstance(uri, str):
+        return False
+    s = uri.strip()
+    if s == "" or s == "***":
+        return True
+    if prev_uri and s == mask_outbound_uri(prev_uri):
+        return True
+    if "://***@" in s:
+        return True
+    return False
+
+
+def validate_and_normalize_routing_payload(
+    payload: dict[str, Any],
+    existing_outbounds: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Validate PUT /api/v1/routing payload and return normalized (outbounds, routing)."""
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a JSON object")
+    allowed_top = {"outbounds", "default_outbound", "rules"}
+    if not set(payload.keys()).issubset(allowed_top):
+        raise ValueError("unsupported top-level keys in routing payload")
+
+    prev_map = {
+        str(ob.get("tag")): str(ob.get("uri") or "")
+        for ob in (existing_outbounds or [])
+        if isinstance(ob, dict) and ob.get("tag")
+    }
+
+    raw_outbounds = payload.get("outbounds", existing_outbounds or [])
+    if not isinstance(raw_outbounds, list):
+        raise ValueError("outbounds must be a list")
+
+    norm_outbounds: list[dict[str, Any]] = []
+    seen_tags: set[str] = set()
+    for item in raw_outbounds:
+        if not isinstance(item, dict):
+            raise ValueError("each outbound must be an object")
+        tag = str(item.get("tag") or "").strip()
+        if not OUTBOUND_TAG_RE.match(tag) or tag.lower() in RESERVED_OUTBOUND_TAGS:
+            raise ValueError(f"invalid or reserved outbound tag: {tag!r}")
+        if tag in seen_tags:
+            raise ValueError(f"duplicate outbound tag: {tag}")
+        seen_tags.add(tag)
+
+        uri_val = item.get("uri")
+        prev_uri = prev_map.get(tag)
+        if is_masked_or_empty_uri(uri_val, prev_uri):
+            if not prev_uri:
+                raise ValueError(f"outbound {tag} requires a valid uri")
+            resolved_uri = prev_uri
+        else:
+            resolved_uri = str(uri_val).strip()
+        parse_outbound_uri(resolved_uri)
+        norm_outbounds.append({"tag": tag, "uri": resolved_uri})
+
+    valid_targets = seen_tags | {"direct"}
+    default_ob = str(payload.get("default_outbound") or "direct").strip()
+    if default_ob not in valid_targets:
+        raise ValueError(f"default_outbound {default_ob!r} is not 'direct' or a defined outbound tag")
+
+    raw_rules = payload.get("rules", [])
+    if not isinstance(raw_rules, list):
+        raise ValueError("rules must be a list")
+
+    norm_rules: list[dict[str, Any]] = []
+    allowed_rule_keys = {"users", "domains", "domain_suffix", "geosite", "ip_cidr", "geoip", "outbound"}
+    for idx, r in enumerate(raw_rules):
+        if not isinstance(r, dict):
+            raise ValueError(f"rule[{idx}] must be an object")
+        if not set(r.keys()).issubset(allowed_rule_keys):
+            raise ValueError(f"rule[{idx}] contains unsupported fields")
+        target_ob = str(r.get("outbound") or "").strip()
+        if target_ob not in valid_targets:
+            raise ValueError(f"rule[{idx}] references unknown outbound {target_ob!r}")
+
+        nr: dict[str, Any] = {"outbound": target_ob}
+        has_cond = False
+        for k in ("users", "domains", "domain_suffix", "geosite", "ip_cidr", "geoip"):
+            vals = r.get(k)
+            if vals is None:
+                continue
+            if not isinstance(vals, list):
+                raise ValueError(f"rule[{idx}].{k} must be a list")
+            cleaned = [str(x).strip() for x in vals if str(x).strip()]
+            if cleaned:
+                if k == "users":
+                    for u in cleaned:
+                        if not USERNAME_RE.match(u):
+                            raise ValueError(f"rule[{idx}].users invalid username {u!r}")
+                elif k == "ip_cidr":
+                    for c in cleaned:
+                        try:
+                            ipaddress.ip_network(c, strict=False)
+                        except ValueError as exc:
+                            raise ValueError(f"rule[{idx}].ip_cidr invalid CIDR {c!r}") from exc
+                nr[k] = cleaned
+                has_cond = True
+        if not has_cond:
+            raise ValueError(f"rule[{idx}] must specify at least one match condition")
+        norm_rules.append(nr)
+
+    return norm_outbounds, {"default_outbound": default_ob, "rules": norm_rules}
+
+
+def outbound_ir_to_xray(tag: str, ir: dict[str, Any]) -> dict[str, Any]:
+    proto = ir["protocol"]
+    server, port = ir["server"], ir["port"]
+
+    if proto == "socks5":
+        srv: dict[str, Any] = {"address": server, "port": port}
+        if ir.get("username") or ir.get("password"):
+            srv["users"] = [{"user": ir.get("username", ""), "pass": ir.get("password", "")}]
+        return {"tag": tag, "protocol": "socks", "settings": {"servers": [srv]}}
+
+    if proto in ("http", "https"):
+        srv = {"address": server, "port": port}
+        if ir.get("username") or ir.get("password"):
+            srv["users"] = [{"user": ir.get("username", ""), "pass": ir.get("password", "")}]
+        ob: dict[str, Any] = {"tag": tag, "protocol": "http", "settings": {"servers": [srv]}}
+        if proto == "https":
+            ob["streamSettings"] = {
+                "security": "tls",
+                "tlsSettings": {"serverName": ir["sni"], "allowInsecure": bool(ir["insecure"])},
+            }
+        return ob
+
+    if proto == "ss":
+        return {
+            "tag": tag,
+            "protocol": "shadowsocks",
+            "settings": {
+                "servers": [{"address": server, "port": port, "method": ir["cipher"], "password": ir["password"]}]
+            },
+        }
+
+    if proto == "vless":
+        user_obj: dict[str, Any] = {"id": ir["uuid"], "encryption": "none"}
+        if ir.get("flow"):
+            user_obj["flow"] = ir["flow"]
+        net = ir.get("network") or "tcp"
+        stream: dict[str, Any] = {"network": "raw" if net == "tcp" else net}
+        if net == "ws":
+            ws_cfg: dict[str, Any] = {"path": ir.get("path") or "/"}
+            if ir.get("host"):
+                ws_cfg["headers"] = {"Host": ir["host"]}
+            stream["wsSettings"] = ws_cfg
+        elif net == "grpc":
+            stream["grpcSettings"] = {"serviceName": ir.get("service_name") or ""}
+        elif net == "xhttp":
+            xh_cfg: dict[str, Any] = {"path": ir.get("path") or "/", "mode": ir.get("mode") or "auto"}
+            if ir.get("host"):
+                xh_cfg["host"] = ir["host"]
+            stream["xhttpSettings"] = xh_cfg
+
+        sec = ir.get("security") or "none"
+        if sec == "tls":
+            stream["security"] = "tls"
+            tls_s: dict[str, Any] = {"serverName": ir["sni"], "allowInsecure": bool(ir["insecure"])}
+            if ir.get("fp"):
+                tls_s["fingerprint"] = ir["fp"]
+            if ir.get("alpn"):
+                tls_s["alpn"] = ir["alpn"]
+            stream["tlsSettings"] = tls_s
+        elif sec == "reality":
+            stream["security"] = "reality"
+            stream["realitySettings"] = {
+                "serverName": ir["sni"],
+                "fingerprint": ir.get("fp") or "chrome",
+                "publicKey": ir.get("pbk") or "",
+                "shortId": ir.get("sid") or "",
+            }
+        return {
+            "tag": tag,
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": server, "port": port, "users": [user_obj]}]},
+            "streamSettings": stream,
+        }
+
+    raise ValueError(f"Xray outbound does not natively support protocol {proto}")
+
+
+def outbound_ir_to_singbox(tag: str, ir: dict[str, Any]) -> dict[str, Any]:
+    proto = ir["protocol"]
+    server, port = ir["server"], ir["port"]
+
+    if proto == "socks5":
+        ob: dict[str, Any] = {"type": "socks", "tag": tag, "server": server, "server_port": port}
+        if ir.get("username") or ir.get("password"):
+            ob["username"] = ir.get("username", "")
+            ob["password"] = ir.get("password", "")
+        return ob
+
+    if proto in ("http", "https"):
+        ob = {"type": "http", "tag": tag, "server": server, "server_port": port}
+        if ir.get("username") or ir.get("password"):
+            ob["username"] = ir.get("username", "")
+            ob["password"] = ir.get("password", "")
+        if proto == "https":
+            ob["tls"] = {"enabled": True, "server_name": ir["sni"], "insecure": bool(ir["insecure"])}
+        return ob
+
+    if proto == "ss":
+        return {
+            "type": "shadowsocks",
+            "tag": tag,
+            "server": server,
+            "server_port": port,
+            "method": ir["cipher"],
+            "password": ir["password"],
+        }
+
+    if proto == "anytls":
+        pw = ir["password"] if not ir.get("username") else (f"{ir['username']}:{ir['password']}" if ir.get("password") else ir["username"])
+        tls_obj: dict[str, Any] = {"enabled": True, "server_name": ir["sni"], "insecure": bool(ir["insecure"])}
+        if ir.get("fp"):
+            tls_obj["utls"] = {"enabled": True, "fingerprint": ir["fp"]}
+        if ir.get("alpn"):
+            tls_obj["alpn"] = ir["alpn"]
+        return {"type": "anytls", "tag": tag, "server": server, "server_port": port, "password": pw, "tls": tls_obj}
+
+    if proto == "hysteria2":
+        pw = f"{ir['username']}:{ir['password']}" if (ir.get("username") and ir.get("password")) else (ir.get("password") or ir.get("username") or "")
+        tls_obj = {"enabled": True, "server_name": ir["sni"], "insecure": bool(ir["insecure"])}
+        ob = {"type": "hysteria2", "tag": tag, "server": server, "server_port": port, "password": pw, "tls": tls_obj}
+        if ir.get("obfs"):
+            ob["obfs"] = {"type": ir["obfs"], "password": ir.get("obfs_password", "")}
+        return ob
+
+    if proto == "vless":
+        ob = {"type": "vless", "tag": tag, "server": server, "server_port": port, "uuid": ir["uuid"]}
+        if ir.get("flow"):
+            ob["flow"] = ir["flow"]
+        net = ir.get("network") or "tcp"
+        if net == "ws":
+            tr: dict[str, Any] = {"type": "ws", "path": ir.get("path") or "/"}
+            if ir.get("host"):
+                tr["headers"] = {"Host": ir["host"]}
+            ob["transport"] = tr
+        elif net == "grpc":
+            ob["transport"] = {"type": "grpc", "service_name": ir.get("service_name") or ""}
+        if ir.get("tls"):
+            tls_obj = {"enabled": True, "server_name": ir["sni"], "insecure": bool(ir["insecure"])}
+            if ir.get("fp"):
+                tls_obj["utls"] = {"enabled": True, "fingerprint": ir["fp"]}
+            if ir.get("alpn"):
+                tls_obj["alpn"] = ir["alpn"]
+            if ir.get("security") == "reality":
+                tls_obj["reality"] = {
+                    "enabled": True,
+                    "public_key": ir.get("pbk") or "",
+                    "short_id": ir.get("sid") or "",
+                }
+            ob["tls"] = tls_obj
+        return ob
+
+    raise ValueError(f"sing-box outbound does not support protocol {proto}")
+
+
+def _build_hysteria_acl_match(rule: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if rule.get("users"):
+        users_lit = ", ".join(json.dumps(u) for u in rule["users"])
+        parts.append(f"auth.id in [{users_lit}]")
+    dest_parts: list[str] = []
+    for d in rule.get("domains") or []:
+        dest_parts.append(f"domain({json.dumps(d)})")
+    for ds in rule.get("domain_suffix") or []:
+        dest_parts.append(f"suffix({json.dumps(ds)})")
+    for gs in rule.get("geosite") or []:
+        dest_parts.append(f"geosite({json.dumps(gs)})")
+    for cidr in rule.get("ip_cidr") or []:
+        dest_parts.append(f"cidr({json.dumps(cidr)})")
+    for gi in rule.get("geoip") or []:
+        dest_parts.append(f"geoip({json.dumps(gi)})")
+    if dest_parts:
+        parts.append("(" + " || ".join(dest_parts) + ")")
+    return " && ".join(parts)
+
+
+def _antiloop_servers(parsed_outbounds: list[tuple[str, dict[str, Any]]]) -> tuple[list[str], list[str]]:
+    ips: list[str] = []
+    domains: list[str] = []
+    for _, ir in parsed_outbounds:
+        srv = ir["server"]
+        try:
+            ipaddress.ip_address(srv)
+            if srv not in ips:
+                ips.append(srv)
+        except ValueError:
+            if srv not in domains:
+                domains.append(srv)
+    return ips, domains
 
 
 class ProxyStateStore:
@@ -1507,10 +1950,47 @@ class ProxyStateStore:
         enabled = self.cfg.get("enabled_protocols") or []
         rendered: dict[str, Path] = {}
 
-        if "anytls" in enabled:
-            sb_cfg = {
-                "log": {"disabled": False, "level": "warn", "timestamp": True},
-                "inbounds": [
+        outbounds_raw = self.cfg.get("outbounds") or []
+        routing_cfg = self.cfg.get("routing") or {}
+        default_outbound = str(routing_cfg.get("default_outbound") or "direct")
+        rules = routing_cfg.get("rules") or []
+
+        parsed_obs: list[tuple[str, dict[str, Any]]] = []
+        for ob in outbounds_raw:
+            parsed_obs.append((str(ob["tag"]), parse_outbound_uri(str(ob["uri"]))))
+
+        antiloop_ips, antiloop_domains = _antiloop_servers(parsed_obs)
+
+        xray_protos_order = ("vless_xhttp_tls", "vless_xhttp", "vless_reality", "ss2022")
+        active_xray_protos = [pr for pr in xray_protos_order if pr in enabled]
+        xray_has_proxy_inbounds = len(active_xray_protos) > 0
+        sb_has_proxy_inbounds = "anytls" in enabled
+
+        # Determine which backend hosts local SOCKS5 bridges for Hysteria2
+        bridge_host: str | None = None
+        bridge_ports: dict[str, int] = {}
+        if "hy2" in enabled and parsed_obs:
+            xray_supported = all(ir["protocol"] in ("socks5", "http", "https", "ss", "vless") for _, ir in parsed_obs)
+            if xray_has_proxy_inbounds and xray_supported:
+                bridge_host = "xray"
+            elif sb_has_proxy_inbounds:
+                bridge_host = "sing-box"
+            elif xray_supported and Path("/usr/local/bin/xray").exists():
+                bridge_host = "xray"
+            elif Path("/usr/local/bin/sing-box").exists():
+                bridge_host = "sing-box"
+            else:
+                bridge_host = "xray" if xray_supported else "sing-box"
+            for idx, (tag, _) in enumerate(parsed_obs):
+                bridge_ports[tag] = 19100 + idx
+
+        need_singbox_cfg = sb_has_proxy_inbounds or (bridge_host == "sing-box")
+        need_xray_cfg = xray_has_proxy_inbounds or (bridge_host == "xray")
+
+        if need_singbox_cfg:
+            sb_inbounds: list[dict[str, Any]] = []
+            if sb_has_proxy_inbounds:
+                sb_inbounds.append(
                     {
                         "type": "anytls",
                         "tag": "anytls-in",
@@ -1522,9 +2002,90 @@ class ProxyStateStore:
                         ],
                         "tls": {"enabled": False},
                     }
-                ],
-                "outbounds": [{"type": "direct", "tag": "direct"}],
-                "experimental": {
+                )
+            if bridge_host == "sing-box":
+                for tag, _ in parsed_obs:
+                    sb_inbounds.append(
+                        {
+                            "type": "socks",
+                            "tag": f"hy2-bridge-{tag}",
+                            "listen": "127.0.0.1",
+                            "listen_port": bridge_ports[tag],
+                        }
+                    )
+
+            sb_outbounds: list[dict[str, Any]] = [{"type": "direct", "tag": "direct"}]
+            for tag, ir in parsed_obs:
+                sb_outbounds.append(outbound_ir_to_singbox(tag, ir))
+
+            sb_rules: list[dict[str, Any]] = []
+            if antiloop_ips or antiloop_domains:
+                anti_rule: dict[str, Any] = {"outbound": "direct"}
+                if antiloop_ips:
+                    anti_rule["ip_cidr"] = [f"{ip}/32" if ":" not in ip else f"{ip}/128" for ip in antiloop_ips]
+                if antiloop_domains:
+                    anti_rule["domain"] = list(antiloop_domains)
+                sb_rules.append(anti_rule)
+
+            if bridge_host == "sing-box":
+                for tag, _ in parsed_obs:
+                    sb_rules.append({"inbound": [f"hy2-bridge-{tag}"], "outbound": tag})
+
+            rule_sets: list[dict[str, Any]] = []
+            seen_rs: set[str] = set()
+
+            def _ensure_rs(kind: str, name: str) -> str:
+                rs_tag = f"{kind}-{name}"
+                if rs_tag not in seen_rs:
+                    seen_rs.add(rs_tag)
+                    repo = "sing-geosite" if kind == "geosite" else "sing-geoip"
+                    rule_sets.append(
+                        {
+                            "tag": rs_tag,
+                            "type": "remote",
+                            "format": "binary",
+                            "url": f"https://raw.githubusercontent.com/SagerNet/{repo}/rule-set/{rs_tag}.srs",
+                            "download_detour": "direct",
+                        }
+                    )
+                return rs_tag
+
+            if sb_has_proxy_inbounds:
+                for r in rules:
+                    sr: dict[str, Any] = {"outbound": r["outbound"]}
+                    if r.get("users"):
+                        sr["auth_user"] = list(r["users"])
+                    if r.get("domains"):
+                        sr["domain"] = list(r["domains"])
+                    if r.get("domain_suffix"):
+                        sr["domain_suffix"] = list(r["domain_suffix"])
+                    if r.get("ip_cidr"):
+                        sr["ip_cidr"] = list(r["ip_cidr"])
+                    rs_tags: list[str] = []
+                    for gs in r.get("geosite") or []:
+                        rs_tags.append(_ensure_rs("geosite", gs))
+                    for gi in r.get("geoip") or []:
+                        rs_tags.append(_ensure_rs("geoip", gi))
+                    if rs_tags:
+                        sr["rule_set"] = rs_tags
+                    if sb_has_proxy_inbounds and bridge_host == "sing-box":
+                        sr["inbound"] = ["anytls-in"]
+                    sb_rules.append(sr)
+
+            sb_route: dict[str, Any] = {"final": default_outbound}
+            if sb_rules:
+                sb_route["rules"] = sb_rules
+            if rule_sets:
+                sb_route["rule_set"] = rule_sets
+
+            sb_cfg: dict[str, Any] = {
+                "log": {"disabled": False, "level": "warn", "timestamp": True},
+                "inbounds": sb_inbounds,
+                "outbounds": sb_outbounds,
+                "route": sb_route,
+            }
+            if sb_has_proxy_inbounds:
+                sb_cfg["experimental"] = {
                     "v2ray_api": {
                         "listen": f"127.0.0.1:{int(self.cfg['anytls']['stats_port'])}",
                         "stats": {
@@ -1533,8 +2094,7 @@ class ProxyStateStore:
                             "users": [u["username"] for u in active_users],
                         },
                     }
-                },
-            }
+                }
             p = STACK_DIR / "sing-box.json"
             self._write_atomic(p, json.dumps(sb_cfg, indent=2))
             rendered["sing-box"] = p
@@ -1566,12 +2126,40 @@ class ProxyStateStore:
                     f"    dir: {self.cfg['web_root']}",
                 ]
             )
+            if parsed_obs:
+                lines.append("outbounds:")
+                lines.append("  - name: direct")
+                lines.append("    type: direct")
+                for tag, _ in parsed_obs:
+                    lines.append(f"  - name: {tag}")
+                    lines.append("    type: socks5")
+                    lines.append("    socks5:")
+                    lines.append(f"      addr: 127.0.0.1:{bridge_ports[tag]}")
+            if parsed_obs and (rules or default_outbound != "direct"):
+                lines.append("acl:")
+                if Path("/usr/local/share/xray/geoip.dat").is_file():
+                    lines.append("  geoip: /usr/local/share/xray/geoip.dat")
+                if Path("/usr/local/share/xray/geosite.dat").is_file():
+                    lines.append("  geosite: /usr/local/share/xray/geosite.dat")
+                lines.append("  rules:")
+                if antiloop_ips or antiloop_domains:
+                    anti_parts = [f"ip({json.dumps(ip)})" for ip in antiloop_ips] + [
+                        f"domain({json.dumps(d)})" for d in antiloop_domains
+                    ]
+                    lines.append("    - outbound: direct")
+                    lines.append(f"      match: {' || '.join(anti_parts)}")
+                for r in rules:
+                    expr = _build_hysteria_acl_match(r)
+                    if expr:
+                        lines.append(f"    - outbound: {r['outbound']}")
+                        lines.append(f"      match: {expr}")
+                lines.append(f"    - outbound: {default_outbound}")
+
             p = STACK_DIR / "hysteria.yaml"
             self._write_atomic(p, "\n".join(lines) + "\n")
             rendered["hysteria"] = p
 
-        xray_protos = {"vless_xhttp_tls", "vless_xhttp", "vless_reality", "ss2022"}
-        if any(pr in enabled for pr in xray_protos):
+        if need_xray_cfg:
             inbounds: list[dict[str, Any]] = [
                 {
                     "tag": "api-in",
@@ -1581,9 +2169,11 @@ class ProxyStateStore:
                     "settings": {"address": "127.0.0.1"},
                 }
             ]
+            xray_proxy_inbound_tags: list[str] = []
 
             if "vless_xhttp_tls" in enabled:
                 xcfg = self.cfg["vless_xhttp_tls"]
+                xray_proxy_inbound_tags.append("vless-xhttp-tls-in")
                 inbounds.append(
                     {
                         "tag": "vless-xhttp-tls-in",
@@ -1607,6 +2197,7 @@ class ProxyStateStore:
 
             if "vless_xhttp" in enabled:
                 xcfg = self.cfg["vless_xhttp"]
+                xray_proxy_inbound_tags.append("vless-xhttp-in")
                 inbounds.append(
                     {
                         "tag": "vless-xhttp-in",
@@ -1630,6 +2221,7 @@ class ProxyStateStore:
 
             if "vless_reality" in enabled:
                 rcfg = self.cfg["vless_reality"]
+                xray_proxy_inbound_tags.append("vless-reality-in")
                 inbounds.append(
                     {
                         "tag": "vless-reality-in",
@@ -1664,6 +2256,7 @@ class ProxyStateStore:
 
             if "ss2022" in enabled:
                 scfg = self.cfg["ss2022"]
+                xray_proxy_inbound_tags.append("ss2022-in")
                 inbounds.append(
                     {
                         "tag": "ss2022-in",
@@ -1682,6 +2275,77 @@ class ProxyStateStore:
                     }
                 )
 
+            if bridge_host == "xray":
+                for tag, _ in parsed_obs:
+                    inbounds.append(
+                        {
+                            "tag": f"hy2-bridge-{tag}",
+                            "listen": "127.0.0.1",
+                            "port": bridge_ports[tag],
+                            "protocol": "socks",
+                            "settings": {"auth": "noauth", "udp": True},
+                        }
+                    )
+
+            xray_outbounds: list[dict[str, Any]] = [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "blocked", "protocol": "blackhole"},
+            ]
+            for tag, ir in parsed_obs:
+                if ir["protocol"] in ("socks5", "http", "https", "ss", "vless"):
+                    xray_outbounds.append(outbound_ir_to_xray(tag, ir))
+
+            xray_rules: list[dict[str, Any]] = [
+                {"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"}
+            ]
+            if antiloop_ips or antiloop_domains:
+                anti_x: dict[str, Any] = {"type": "field", "outboundTag": "direct"}
+                if antiloop_ips:
+                    anti_x["ip"] = list(antiloop_ips)
+                if antiloop_domains:
+                    anti_x["domain"] = [f"full:{d}" for d in antiloop_domains]
+                xray_rules.append(anti_x)
+
+            if bridge_host == "xray":
+                for tag, _ in parsed_obs:
+                    xray_rules.append(
+                        {"type": "field", "inboundTag": [f"hy2-bridge-{tag}"], "outboundTag": tag}
+                    )
+
+            if xray_proxy_inbound_tags:
+                for r in rules:
+                    xr: dict[str, Any] = {
+                        "type": "field",
+                        "inboundTag": xray_proxy_inbound_tags,
+                        "outboundTag": r["outbound"],
+                    }
+                    if r.get("users"):
+                        xr["user"] = [f"{u}:{pr}" for u in r["users"] for pr in active_xray_protos]
+                    dom_list: list[str] = []
+                    for d in r.get("domains") or []:
+                        dom_list.append(f"full:{d}")
+                    for ds in r.get("domain_suffix") or []:
+                        dom_list.append(f"domain:{ds}")
+                    for gs in r.get("geosite") or []:
+                        dom_list.append(f"geosite:{gs}")
+                    if dom_list:
+                        xr["domain"] = dom_list
+                    ip_list: list[str] = list(r.get("ip_cidr") or [])
+                    for gi in r.get("geoip") or []:
+                        ip_list.append(f"geoip:{gi}")
+                    if ip_list:
+                        xr["ip"] = ip_list
+                    xray_rules.append(xr)
+
+                if default_outbound != "direct":
+                    xray_rules.append(
+                        {
+                            "type": "field",
+                            "inboundTag": xray_proxy_inbound_tags,
+                            "outboundTag": default_outbound,
+                        }
+                    )
+
             xray_cfg = {
                 "log": {"loglevel": "warning"},
                 "stats": {},
@@ -1691,19 +2355,68 @@ class ProxyStateStore:
                     "system": {"statsInboundUplink": True, "statsInboundDownlink": True},
                 },
                 "inbounds": inbounds,
-                "outbounds": [
-                    {"tag": "direct", "protocol": "freedom"},
-                    {"tag": "blocked", "protocol": "blackhole"},
-                ],
-                "routing": {
-                    "rules": [{"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"}]
-                },
+                "outbounds": xray_outbounds,
+                "routing": {"domainStrategy": "AsIs", "rules": xray_rules},
             }
             p = STACK_DIR / "xray.json"
             self._write_atomic(p, json.dumps(xray_cfg, indent=2))
             rendered["xray"] = p
 
         return rendered
+
+    def get_routing_masked(self) -> dict[str, Any]:
+        outbounds_out = []
+        for ob in self.cfg.get("outbounds") or []:
+            tag = str(ob.get("tag") or "")
+            raw_uri = str(ob.get("uri") or "")
+            try:
+                ir = parse_outbound_uri(raw_uri)
+                outbounds_out.append(
+                    {
+                        "tag": tag,
+                        "uri": mask_outbound_uri(raw_uri),
+                        "protocol": ir["protocol"],
+                        "server": ir["server"],
+                        "port": ir["port"],
+                    }
+                )
+            except Exception:
+                outbounds_out.append({"tag": tag, "uri": "***", "protocol": "unknown", "server": "", "port": 0})
+        routing = self.cfg.get("routing") or {}
+        return {
+            "default_outbound": routing.get("default_outbound") or "direct",
+            "outbounds": outbounds_out,
+            "rules": routing.get("rules") or [],
+        }
+
+    def update_routing(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.lock:
+            norm_obs, norm_routing = validate_and_normalize_routing_payload(
+                payload, existing_outbounds=self.cfg.get("outbounds") or []
+            )
+            old_cfg = copy.deepcopy(self.cfg)
+            cfg_file = STACK_DIR / "config.json"
+            backups: dict[Path, bytes | None] = {}
+            for fp in (cfg_file, STACK_DIR / "sing-box.json", STACK_DIR / "xray.json", STACK_DIR / "hysteria.yaml"):
+                backups[fp] = fp.read_bytes() if fp.exists() else None
+
+            self.cfg["outbounds"] = norm_obs
+            self.cfg["routing"] = norm_routing
+            try:
+                self._write_atomic(cfg_file, json.dumps(self.cfg, indent=2, ensure_ascii=False))
+                self.render_and_reload_backends()
+            except Exception as exc:
+                self.cfg = old_cfg
+                for fp, data in backups.items():
+                    if data is None:
+                        fp.unlink(missing_ok=True)
+                    else:
+                        fp.write_bytes(data)
+                        os.chmod(fp, 0o600)
+                if isinstance(exc, ValueError):
+                    raise
+                raise RuntimeError(f"backend reload failed: {exc}") from exc
+            return self.get_routing_masked()
 
     @staticmethod
     def _write_atomic(path: Path, content: str) -> None:
@@ -2069,6 +2782,14 @@ def make_api_handler(store: ProxyStateStore, token_path: Path = TOKEN_PATH):
                 self._send_json(200, store.query_usage(uname, p_all, d_from, d_to))
                 return
 
+            # GET /api/v1/routing
+            if path == "/api/v1/routing":
+                if parsed.query:
+                    self._send_json(404, {"error": "not found"})
+                    return
+                self._send_json(200, store.get_routing_masked())
+                return
+
             self._send_json(404, {"error": "not found"})
 
         def _drain_body(self, max_drain: int = 65536) -> None:
@@ -2147,8 +2868,50 @@ def make_api_handler(store: ProxyStateStore, token_path: Path = TOKEN_PATH):
 
         def do_PUT(self) -> None:
             if not self._check_auth():
+                self._drain_body()
                 return
-            self._send_json(404, {"error": "not found"})
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path != "/api/v1/routing" or parsed.query:
+                self._drain_body()
+                self._send_json(404, {"error": "not found"})
+                return
+
+            ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+            if ctype != "application/json":
+                self._drain_body()
+                self._send_json(415, {"error": "Content-Type must be application/json"})
+                return
+
+            try:
+                clen = int(self.headers.get("Content-Length") or "0")
+            except ValueError:
+                self._send_json(400, {"error": "invalid Content-Length"})
+                return
+            if clen > 65536:
+                self._drain_body(max_drain=131072)
+                self._send_json(413, {"error": "payload too large (max 65536 bytes)"})
+                return
+            raw_body = self.rfile.read(min(clen, 65537))
+            if len(raw_body) > 65536:
+                self._send_json(413, {"error": "payload too large (max 65536 bytes)"})
+                return
+
+            try:
+                body = json.loads(raw_body.decode("utf-8"))
+            except Exception:
+                self._send_json(400, {"error": "invalid JSON"})
+                return
+
+            try:
+                result = store.update_routing(body)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except RuntimeError as exc:
+                self._send_json(503, {"error": str(exc)})
+                return
+
+            self._send_json(200, result)
 
         def do_DELETE(self) -> None:
             if not self._check_auth():
@@ -2272,6 +3035,22 @@ def cli_main(argv: list[str]) -> int:
         print(json.dumps(store.query_usage(uname), indent=2, ensure_ascii=False))
         return 0
 
+    if cmd == "routing":
+        if len(argv) == 1:
+            print(json.dumps(store.get_routing_masked(), indent=2, ensure_ascii=False))
+            return 0
+        if len(argv) == 3 and argv[1] == "set":
+            try:
+                payload = json.loads(Path(argv[2]).read_text(encoding="utf-8"))
+                res = store.update_routing(payload)
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                return 0
+            except Exception as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
+        print("Usage: proxy-user routing [set <json_file>]", file=sys.stderr)
+        return 1
+
     print(f"Unknown command: {' '.join(argv)}", file=sys.stderr)
     return 1
 
@@ -2305,7 +3084,7 @@ case "${1:-}" in
     chmod 600 "$TOKEN_FILE"
     printf '%s\n' "$NEW_TOKEN"
     ;;
-  list|links|create|set-quota|delete|usage|render)
+  list|links|create|set-quota|delete|usage|render|routing)
     exec python3 "$MANAGER" "$@"
     ;;
   status)
@@ -2334,6 +3113,7 @@ case "${1:-}" in
   set-quota <user> <quota>      修改用户月配额
   delete <user>                 删除用户
   usage [user]                  查看全站或指定用户本期各协议用量
+  routing [set <json_file>]     查看当前多出站与路由规则，或从 JSON 文件应用
   render                        重新渲染配置并重载代理内核
   upgrade [target]              手动更新内核 (all|caddy|sing-box|hy2|xray)
   self-update                   更新部署脚本自身到最新版本
@@ -2434,9 +3214,22 @@ if "ss2022" in enabled:
         "method": "2022-blake3-aes-128-gcm",
         "server_psk": "${ss2022_server_psk}",
     }
-with open("${STACK_DIR}/config.json", "w", encoding="utf-8") as f:
+from pathlib import Path
+cfg_path = Path("${STACK_DIR}/config.json")
+if cfg_path.exists():
+    try:
+        old = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if isinstance(old.get("outbounds"), list):
+            cfg["outbounds"] = old["outbounds"]
+        if isinstance(old.get("routing"), dict):
+            cfg["routing"] = old["routing"]
+    except Exception:
+        pass
+cfg.setdefault("outbounds", [])
+cfg.setdefault("routing", {"default_outbound": "direct", "rules": []})
+with open(cfg_path, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
-os.chmod("${STACK_DIR}/config.json", 0o600)
+os.chmod(cfg_path, 0o600)
 PYGEN
 
   # 生成 Caddyfile

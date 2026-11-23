@@ -13,6 +13,8 @@
 | GET | `/users` | 查询所有用户的本期用量、额度和状态 |
 | GET | `/usage` | 查询全站及各协议用量 |
 | GET | `/users/{username}/usage` | 查询指定用户及各协议用量 |
+| GET | `/routing` | 获取当前多出站（脱敏）与路由规则 |
+| PUT | `/routing` | 原子校验、更新并热加载多出站与路由规则 |
 
 ## 创建用户 · POST /users
 
@@ -98,6 +100,69 @@ curl -fsS -H "Authorization: Bearer $TOKEN" \
 上传、下载和总量以字节计。顶层字段已汇总两个协议。`last_sample` 为最近一次成功采样时间，通常每 10 秒更新。`cycle_start` 和 `next_reset` 始终描述当前配额周期。时间戳均为 Unix 秒。
 
 `GET /users` 返回相同的时间与时区字段，以及 `users` 数组。每个元素包含 `user`、`used_bytes`、`quota_bytes`、`remaining_bytes` 和 `status`。不限量时额度与剩余额度均为 `null`。状态为 `active` 或 `quota_exceeded`。
+
+## 多出站与按用户/规则路由 · GET / PUT /routing
+
+支持配置多个命名出站（`socks5://`、`http://`、`https://`、`vless://`、`anytls://`、`hysteria2://`、`ss://`）及有序路由规则，并自动确保所有出站服务器自身走 `direct` 防止回环。
+
+### 查询路由 · GET /routing
+
+```bash
+curl -fsS -H "Authorization: Bearer $TOKEN" "$API/routing"
+```
+
+成功返回 **200 OK**（`uri` 中的用户名/密码/UUID 已脱敏为 `***`）：
+
+```json
+{
+  "default_outbound": "direct",
+  "outbounds": [
+    {
+      "tag": "us-socks",
+      "uri": "socks5://***@1.2.3.4:1080#US",
+      "protocol": "socks5",
+      "server": "1.2.3.4",
+      "port": 1080
+    }
+  ],
+  "rules": [
+    {
+      "users": ["alice"],
+      "domain_suffix": ["openai.com"],
+      "geosite": ["google"],
+      "outbound": "us-socks"
+    }
+  ]
+}
+```
+
+### 更新路由 · PUT /routing
+
+```bash
+curl -fsS -X PUT "$API/routing" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "default_outbound": "direct",
+    "outbounds": [
+      {"tag": "us-socks", "uri": "socks5://user:pass@1.2.3.4:1080#US"}
+    ],
+    "rules": [
+      {
+        "users": ["alice", "bob"],
+        "domains": ["ifconfig.me"],
+        "domain_suffix": ["openai.com"],
+        "geosite": ["google"],
+        "ip_cidr": ["1.1.1.0/24"],
+        "geoip": ["us"],
+        "outbound": "us-socks"
+      }
+    ]
+  }'
+```
+
+- **保留已有凭据**：更新 `outbounds` 时若某项 `uri` 留空或保持脱敏掩码（如 `socks5://***@1.2.3.4:1080#US`），将自动沿用已保存的同 `tag` 出站原始 `uri`。
+- **原子校验与回滚**：服务端先校验参数及内核配置（`sing-box check` / `xray -test`），失败自动回滚并返回 `400` 或 `503`；成功则返回更新后的脱敏配置（`200 OK`）。
 
 ## 错误码
 

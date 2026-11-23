@@ -99,6 +99,10 @@ proxy-user set-quota alice 200GiB
 proxy-user usage
 proxy-user usage alice
 
+# 查看或通过 JSON 文件更新多出站与路由规则
+proxy-user routing
+proxy-user routing set /tmp/routing.json
+
 # 删除用户
 proxy-user delete alice
 
