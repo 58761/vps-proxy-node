@@ -43,6 +43,7 @@ RESET_DAY="${RESET_DAY:-1}"
 SELECTED_PROTOCOLS="${SELECTED_PROTOCOLS:-}"
 ANYTLS_DOMAIN="${ANYTLS_DOMAIN:-}"
 HY2_DOMAIN="${HY2_DOMAIN:-}"
+HY2_HOP_RANGE="${HY2_HOP_RANGE:-}"
 XHTTP_TLS_DOMAIN="${XHTTP_TLS_DOMAIN:-}"
 XHTTP_TLS_PATH="${XHTTP_TLS_PATH:-}"
 XHTTP_PORT="${XHTTP_PORT:-}"
@@ -108,6 +109,7 @@ usage() {
                              anytls,hy2,vless_xhttp_tls,vless_xhttp,vless_reality,ss2022
   ANYTLS_DOMAIN              AnyTLS 域名 (默认 ats.<MAIN_DOMAIN>)
   HY2_DOMAIN                 Hysteria2 域名 (默认 <MAIN_DOMAIN>)
+  HY2_HOP_RANGE              Hysteria2 端口跳跃 UDP 范围 (可选, 如 20000-50000 或 none)
   XHTTP_TLS_DOMAIN           VLESS+XHTTP+TLS 域名 (默认 xhttp.<MAIN_DOMAIN>)
   XHTTP_PORT                 VLESS+XHTTP 端口 (默认随机 20000-55000)
   REALITY_PORT               VLESS+Reality 端口 (默认随机 20000-55000)
@@ -159,14 +161,15 @@ require_root() {
 do_uninstall() {
   require_root
   log_warn "即将停止并移除所有代理节点服务与配置..."
-  local services=(proxy-manager caddy sing-box-proxy hysteria-proxy xray-proxy)
+  local services=(proxy-manager caddy sing-box-proxy hysteria-proxy xray-proxy hy2-port-hopping)
   for svc in "${services[@]}"; do
     systemctl stop "$svc" 2>/dev/null || true
     systemctl disable "$svc" 2>/dev/null || true
     rm -f "/etc/systemd/system/${svc}.service"
   done
   systemctl daemon-reload 2>/dev/null || true
-  rm -rf "$STACK_DIR" "$APP_DIR" "$DATA_DIR" "$WEB_ROOT" /usr/local/bin/proxy-user
+  rm -rf "$STACK_DIR" "$APP_DIR" "$DATA_DIR" "$WEB_ROOT" /usr/local/bin/proxy-user /etc/sysctl.d/99-proxy-stack.conf
+  sysctl --system >/dev/null 2>&1 || true
   log_ok "卸载完成（二进制文件 /usr/local/bin/{caddy,xray,sing-box,hysteria,grpcurl} 已保留，如需彻底清理可手动删除）。"
   exit 0
 }
@@ -315,6 +318,7 @@ if isinstance(cfg.get("anytls"), dict):
     emit("ANYTLS_DOMAIN", cfg["anytls"].get("domain"))
 if isinstance(cfg.get("hy2"), dict):
     emit("HY2_DOMAIN", cfg["hy2"].get("domain"))
+    emit("HY2_HOP_RANGE", cfg["hy2"].get("hop_ports"))
     emit("HY2_STATS_SECRET", cfg["hy2"].get("stats_secret"))
 if isinstance(cfg.get("vless_xhttp_tls"), dict):
     emit("XHTTP_TLS_DOMAIN", cfg["vless_xhttp_tls"].get("domain"))
@@ -343,6 +347,17 @@ validate_domain() {
   [[ "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]]
 }
 
+validate_port_range() {
+  local r="$1"
+  if [[ "$r" =~ ^([0-9]{4,5})-([0-9]{4,5})$ ]]; then
+    local s="${BASH_REMATCH[1]}" e="${BASH_REMATCH[2]}"
+    if (( s >= 1024 && e <= 65535 && s < e )); then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 # ==============================================================================
 # 交互式 / 非交互式参数收集 (支持首次安装 + 自动增量 / --add / --remove)
 # ==============================================================================
@@ -359,12 +374,28 @@ fill_missing_protocol_params() {
     fi
   fi
 
-  if proto_enabled "hy2" && [[ -z "$HY2_DOMAIN" ]]; then
-    if [[ "$interactive" -eq 1 ]]; then
-      read -rp "请输入 Hysteria2 域名 [默认: ${MAIN_DOMAIN}]: " input_hy2
-      HY2_DOMAIN="${input_hy2:-${MAIN_DOMAIN}}"
-    else
-      HY2_DOMAIN="${MAIN_DOMAIN}"
+  if proto_enabled "hy2"; then
+    if [[ -z "$HY2_DOMAIN" ]]; then
+      if [[ "$interactive" -eq 1 ]]; then
+        read -rp "请输入 Hysteria2 域名 [默认: ${MAIN_DOMAIN}]: " input_hy2
+        HY2_DOMAIN="${input_hy2:-${MAIN_DOMAIN}}"
+      else
+        HY2_DOMAIN="${MAIN_DOMAIN}"
+      fi
+    fi
+    if [[ -z "$HY2_HOP_RANGE" ]]; then
+      if [[ "$interactive" -eq 1 ]]; then
+        read -rp "请输入 Hysteria2 端口跳跃 UDP 范围 (如 20000-50000, 回车不启用): " input_hop
+        HY2_HOP_RANGE="${input_hop:-}"
+      fi
+    fi
+    if [[ "$HY2_HOP_RANGE" == "none" || "$HY2_HOP_RANGE" == "off" ]]; then
+      HY2_HOP_RANGE=""
+    elif [[ "$HY2_HOP_RANGE" == "auto" ]]; then
+      HY2_HOP_RANGE="30000-45000"
+    elif [[ -n "$HY2_HOP_RANGE" ]] && ! validate_port_range "$HY2_HOP_RANGE"; then
+      log_err "Hysteria2 端口跳跃范围无效: ${HY2_HOP_RANGE} (格式应为 start-end，如 20000-50000)"
+      exit 1
     fi
   fi
 
@@ -440,13 +471,14 @@ collect_config() {
   if [[ -f "${STACK_DIR}/config.json" && "$FORCE_REINSTALL" -eq 0 ]]; then
     INCREMENTAL_MODE=1
     # 暂存用户通过环境变量显式覆盖的新增参数，加载旧配置后再补回空缺项
-    local env_anytls_dom="$ANYTLS_DOMAIN" env_hy2_dom="$HY2_DOMAIN" env_xht_dom="$XHTTP_TLS_DOMAIN"
+    local env_anytls_dom="$ANYTLS_DOMAIN" env_hy2_dom="$HY2_DOMAIN" env_hy2_hop="$HY2_HOP_RANGE" env_xht_dom="$XHTTP_TLS_DOMAIN"
     local env_xht_path="$XHTTP_TLS_PATH" env_xh_port="$XHTTP_PORT" env_xh_path="$XHTTP_PATH"
     local env_r_port="$REALITY_PORT" env_r_dest="$REALITY_DEST" env_r_sni="$REALITY_SNI" env_ss_port="$SS2022_PORT"
     load_existing_config
-    # 若旧配置中未包含某协议参数，则允许环境变量提供初始值
+    # 若旧配置中未包含某协议参数，或用户显式传入 HY2_HOP_RANGE，则允许环境变量更新
     [[ -z "$ANYTLS_DOMAIN" && -n "$env_anytls_dom" ]] && ANYTLS_DOMAIN="$env_anytls_dom"
     [[ -z "$HY2_DOMAIN" && -n "$env_hy2_dom" ]] && HY2_DOMAIN="$env_hy2_dom"
+    [[ -n "$env_hy2_hop" ]] && HY2_HOP_RANGE="$env_hy2_hop"
     [[ -z "$XHTTP_TLS_DOMAIN" && -n "$env_xht_dom" ]] && XHTTP_TLS_DOMAIN="$env_xht_dom"
     [[ -z "$XHTTP_TLS_PATH" && -n "$env_xht_path" ]] && XHTTP_TLS_PATH="$env_xht_path"
     [[ -z "$XHTTP_PORT" && -n "$env_xh_port" ]] && XHTTP_PORT="$env_xh_port"
@@ -617,7 +649,13 @@ collect_config() {
   echo "  主域名 (伪装站 & API) : ${MAIN_DOMAIN}"
   echo "  已启用协议            : ${ENABLED_PROTOCOLS_CSV}"
   proto_enabled "anytls"          && echo "  AnyTLS                : ${ANYTLS_DOMAIN}:443 (TCP)"
-  proto_enabled "hy2"             && echo "  Hysteria2             : ${HY2_DOMAIN}:443 (UDP)"
+  if proto_enabled "hy2"; then
+    if [[ -n "$HY2_HOP_RANGE" ]]; then
+      echo "  Hysteria2             : ${HY2_DOMAIN}:443 (UDP, 端口跳跃=${HY2_HOP_RANGE})"
+    else
+      echo "  Hysteria2             : ${HY2_DOMAIN}:443 (UDP)"
+    fi
+  fi
   proto_enabled "vless_xhttp_tls" && echo "  VLESS+XHTTP+TLS       : ${XHTTP_TLS_DOMAIN}:443 (TCP, path=${XHTTP_TLS_PATH})"
   proto_enabled "vless_xhttp"     && echo "  VLESS+XHTTP           : ${MAIN_DOMAIN}:${XHTTP_PORT} (TCP, path=${XHTTP_PATH})"
   proto_enabled "vless_reality"   && echo "  VLESS+Reality         : ${MAIN_DOMAIN}:${REALITY_PORT} (TCP, sni=${REALITY_SNI}, dest=${REALITY_DEST})"
@@ -1089,7 +1127,9 @@ def build_user_links(cfg: dict[str, Any], username: str, creds: dict[str, str]) 
         dom = cfg["hy2"]["domain"]
         pw = urllib.parse.quote(creds["hy2_password"], safe="")
         uname_q = urllib.parse.quote(username, safe="")
-        links["hy2"] = f"hysteria2://{uname_q}:{pw}@{dom}:443/?sni={dom}#{username}-Hy2"
+        hop = cfg["hy2"].get("hop_ports") or ""
+        mport_q = f"&mport={hop}" if hop else ""
+        links["hy2"] = f"hysteria2://{uname_q}:{pw}@{dom}:443/?sni={dom}{mport_q}#{username}-Hy2"
 
     if "vless_xhttp_tls" in enabled:
         dom = cfg["vless_xhttp_tls"]["domain"]
@@ -2360,6 +2400,7 @@ if "anytls" in enabled:
 if "hy2" in enabled:
     cfg["hy2"] = {
         "domain": "${HY2_DOMAIN}",
+        "hop_ports": "${HY2_HOP_RANGE}",
         "local_port": ${PORT_HY2_LOCAL},
         "stats_port": ${PORT_HY2_STATS},
         "stats_secret": "${hy2_stats_secret}",
@@ -2668,10 +2709,109 @@ EOF
   systemctl daemon-reload
 }
 
+configure_sysctl_tuning() {
+  if [[ "${ENABLE_SYSCTL_TUNING:-1}" == "0" ]]; then
+    log_info "已跳过 BBR 与 UDP 缓冲区优化 (ENABLE_SYSCTL_TUNING=0)。"
+    return 0
+  fi
+  log_info "配置 BBR 拥塞控制与 UDP 缓冲区优化..."
+  modprobe tcp_bbr 2>/dev/null || true
+  cat > /etc/sysctl.d/99-proxy-stack.conf <<'EOF'
+# Proxy Stack Network Tuning (BBR + UDP Buffers)
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
+net.core.netdev_max_backlog = 16384
+EOF
+  if sysctl -p /etc/sysctl.d/99-proxy-stack.conf >/dev/null 2>&1; then
+    local cc
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    log_ok "网络调优已生效 (tcp_congestion_control=${cc}, UDP rmem/wmem_max=16MiB)"
+  else
+    log_warn "部分 sysctl 参数在当前内核/容器环境不可用，已尽力应用兼容项。"
+  fi
+}
+
+configure_hy2_port_hopping() {
+  local svc_file="/etc/systemd/system/hy2-port-hopping.service"
+  local helper="${APP_DIR}/hy2-port-hopping.sh"
+
+  if ! proto_enabled "hy2" || [[ -z "${HY2_HOP_RANGE:-}" ]]; then
+    if [[ -f "$svc_file" ]]; then
+      systemctl stop hy2-port-hopping 2>/dev/null || true
+      systemctl disable hy2-port-hopping 2>/dev/null || true
+      rm -f "$svc_file" "$helper"
+      systemctl daemon-reload
+      log_info "已移除 Hysteria2 端口跳跃规则。"
+    fi
+    return 0
+  fi
+
+  local hop_colon="${HY2_HOP_RANGE//-/:}"
+  if ! command -v iptables >/dev/null 2>&1; then
+    if [[ "$PKG_MGR" == "apt" ]]; then
+      apt-get install -y -qq iptables >/dev/null
+    else
+      "$PKG_MGR" install -y -q iptables >/dev/null
+    fi
+  fi
+
+  cat > "$helper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+CHAIN="PROXY_HY2_HOP"
+ACTION="\${1:-start}"
+
+apply_for() {
+  local bin="\$1"
+  command -v "\$bin" >/dev/null 2>&1 || return 0
+  "\$bin" -t nat -N "\$CHAIN" 2>/dev/null || true
+  "\$bin" -t nat -F "\$CHAIN"
+  while "\$bin" -t nat -D PREROUTING -p udp -j "\$CHAIN" 2>/dev/null; do :; done
+  if [[ "\$ACTION" == "start" ]]; then
+    "\$bin" -t nat -A "\$CHAIN" -p udp --dport ${hop_colon} -j REDIRECT --to-ports 443
+    "\$bin" -t nat -I PREROUTING 1 -p udp -j "\$CHAIN"
+  else
+    "\$bin" -t nat -X "\$CHAIN" 2>/dev/null || true
+  fi
+}
+
+apply_for iptables
+apply_for ip6tables
+EOF
+  chmod 755 "$helper"
+
+  cat > "$svc_file" <<EOF
+[Unit]
+Description=Hysteria2 UDP Port Hopping NAT Redirect (${HY2_HOP_RANGE} -> 443)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${helper} start
+ExecStop=${helper} stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable hy2-port-hopping >/dev/null 2>&1 || true
+  systemctl restart hy2-port-hopping
+  log_ok "Hysteria2 端口跳跃已生效 (UDP ${HY2_HOP_RANGE} -> 443，已配置开机自启)"
+}
+
 configure_firewall() {
   local tcp_ports=(80 443)
-  local udp_ports=()
-  proto_enabled "hy2"           && udp_ports+=(443)
+  local udp_ports=(443)
+  proto_enabled "hy2"           || udp_ports=()
   proto_enabled "vless_xhttp"   && tcp_ports+=("$XHTTP_PORT")
   proto_enabled "vless_reality" && tcp_ports+=("$REALITY_PORT")
   proto_enabled "ss2022"        && { tcp_ports+=("$SS2022_PORT"); udp_ports+=("$SS2022_PORT"); }
@@ -2680,10 +2820,16 @@ configure_firewall() {
     log_info "配置 UFW 防火墙放行端口..."
     for p in "${tcp_ports[@]}"; do ufw allow "${p}/tcp" >/dev/null || true; done
     for p in "${udp_ports[@]}"; do ufw allow "${p}/udp" >/dev/null || true; done
+    if proto_enabled "hy2" && [[ -n "${HY2_HOP_RANGE:-}" ]]; then
+      ufw allow "${HY2_HOP_RANGE//-/:}/udp" >/dev/null || true
+    fi
   elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
     log_info "配置 firewalld 放行端口..."
     for p in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null || true; done
     for p in "${udp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/udp" >/dev/null || true; done
+    if proto_enabled "hy2" && [[ -n "${HY2_HOP_RANGE:-}" ]]; then
+      firewall-cmd --permanent --add-port="${HY2_HOP_RANGE}/udp" >/dev/null || true
+    fi
     firewall-cmd --reload >/dev/null || true
   fi
 }
@@ -2884,6 +3030,8 @@ main() {
   install_self_script
   generate_configs
   setup_systemd_services
+  configure_sysctl_tuning
+  configure_hy2_port_hopping
   configure_firewall
   start_all_services
   print_summary

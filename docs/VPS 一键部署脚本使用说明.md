@@ -6,13 +6,14 @@
 
 1. **6 种协议按需部署**（可任选组合，未选协议不安装多余内核）：
    - `anytls`：443/TCP，由 Caddy (`caddy-l4`) 按 SNI 转发至 `sing-box`，非代理 HTTP 探测自动回落静态伪装页。
-   - `hy2`：443/UDP，由 Caddy (`caddy-l4`) 按 QUIC SNI 转发至 `Hysteria2`，握手/鉴权失败由内置 `masquerade` 返回静态伪装页。
+   - `hy2`：443/UDP 直连 `Hysteria2`（支持 `HY2_HOP_RANGE` 端口跳跃 NAT 重定向），握手/鉴权失败由内置 `masquerade` 返回静态伪装页。
    - `vless+xhttp+tls`：443/TCP，由 Caddy 按 SNI 与路径（`h2c`）转发至 `Xray-core`，非匹配路径返回静态伪装页。
    - `vless+xhttp`：自定义或随机 TCP 端口（无 TLS），由 Caddy 按路径（`h2c`）转发至 `Xray-core`，其余路径返回静态伪装页。
    - `vless+reality`：自定义或随机 TCP 端口，由 `Xray-core` 承载，默认回落至本机 Caddy HTTPS 伪装站（也可自定义外部回落目标）。
    - `ss2022`：自定义或随机 TCP+UDP 端口（`2022-blake3-aes-128-gcm` 多用户），由 `Xray-core` 承载。
 2. **自动证书签发与续期**：基于 Caddy HTTP-01 自动签发与续期所有启用域名的 TLS 证书，并自动同步续期后的证书至 Hysteria2。
 3. **分协议分用户流量监控与管理 API**：每 10 秒增量采样并写入 SQLite (WAL)，超额自动标记 `quota_exceeded` 停用并在新周期自动恢复；完整兼容 [节点流量与用户管理 API.md](file:///g:/Documents/Antigravity/vps订阅管理/docs/节点流量与用户管理%20API.md)。
+4. **网络栈调优**：自动写入 `/etc/sysctl.d/99-proxy-stack.conf` 开启 `fq` + `BBR` 拥塞控制，并将 UDP 收发缓冲区提升至 16MiB（可通过 `ENABLE_SYSCTL_TUNING=0` 跳过）。
 
 ## 部署前置条件
 
@@ -48,6 +49,7 @@ sudo MAIN_DOMAIN="de.example.com" \
   SELECTED_PROTOCOLS="anytls,hy2,vless_xhttp_tls,vless_xhttp,vless_reality,ss2022" \
   ANYTLS_DOMAIN="ats.de.example.com" \
   XHTTP_TLS_DOMAIN="xhttp.de.example.com" \
+  HY2_HOP_RANGE="20000-50000" \
   bash vps-node-install.sh --non-interactive
 ```
 
